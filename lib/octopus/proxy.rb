@@ -26,7 +26,7 @@ module Octopus
       :type_cast, :to_sql, :quote, :quote_column_name, :quote_table_name,
       :quote_table_name_for_assignment, :supports_migrations?, :table_alias_for,
       :table_exists?, :in_clause_length, :supports_ddl_transactions?,
-      :sanitize_limit, :prefetch_primary_key?, :current_database,
+      :sanitize_limit, :prefetch_primary_key?, :current_database, :initialize_schema_migrations_table,
       :combine_bind_parameters, :empty_insert_statement_value, :assume_migrated_upto_version,
       :schema_cache, :substitute_at, :internal_string_options_for_primary_key, :lookup_cast_type_from_column,
       :supports_advisory_locks?, :get_advisory_lock, :initialize_internal_metadata_table,
@@ -34,22 +34,55 @@ module Octopus
       :prepared_statements, :transaction_state, :create_table, to: :select_connection
 
     def execute(sql, name = nil)
-      conn = select_connection
-      clean_connection_proxy if should_clean_connection_proxy?('execute')
-      conn.execute(sql, name)
+      begin
+        retries ||= 0
+        conn = select_connection
+        clean_connection_proxy if should_clean_connection_proxy?('execute')
+        conn.execute(sql, name)
+      rescue ActiveRecord::StatementInvalid => e
+        if connection_bad(e.message)
+          Octopus.logger.error "Octopus.logger.error execute: #{e.message}"
+          conn.verify!
+          retry if (retries += 1) < 3
+        else
+          raise e.message
+        end
+      end
     end
 
     def insert(arel, name = nil, pk = nil, id_value = nil, sequence_name = nil, binds = [])
-      conn = select_connection
-      clean_connection_proxy if should_clean_connection_proxy?('insert')
-      conn.insert(arel, name, pk, id_value, sequence_name, binds)
+      begin
+        retries ||= 0
+        conn = select_connection
+        clean_connection_proxy if should_clean_connection_proxy?('insert')
+        conn.insert(arel, name, pk, id_value, sequence_name, binds)
+      rescue ActiveRecord::StatementInvalid => e
+        if connection_bad(e.message)
+          Octopus.logger.error "Octopus.logger.error insert: #{e.message}"
+          conn.verify!
+          retry if (retries += 1) < 3
+        else
+          raise e.message
+        end
+      end
     end
 
     def update(arel, name = nil, binds = [])
-      conn = select_connection
-      # Call the legacy should_clean_connection_proxy? method here, emulating an insert.
-      clean_connection_proxy if should_clean_connection_proxy?('insert')
-      conn.update(arel, name, binds)
+      begin
+        retries ||= 0
+        conn = select_connection
+        # Call the legacy should_clean_connection_proxy? method here, emulating an insert.
+        clean_connection_proxy if should_clean_connection_proxy?('insert')
+        conn.update(arel, name, binds)
+      rescue ActiveRecord::StatementInvalid => e
+        if connection_bad(e.message)
+          Octopus.logger.error "Octopus.logger.error update: #{e.message}"
+          conn.verify!
+          retry if (retries += 1) < 3
+        else
+          raise e.message
+        end
+      end
     end
 
     def delete(*args, &block)
@@ -118,12 +151,23 @@ module Octopus
     end
 
     def transaction(options = {}, &block)
-      if !sharded && current_model_replicated?
-        run_queries_on_shard(Octopus.master_shard) do
+      begin
+        retries ||= 0
+        if !sharded && current_model_replicated?
+          run_queries_on_shard(Octopus.master_shard) do
+            select_connection.transaction(options, &block)
+          end
+        else
           select_connection.transaction(options, &block)
         end
-      else
-        select_connection.transaction(options, &block)
+      rescue ActiveRecord::StatementInvalid => e
+        if connection_bad(e.message)
+          Octopus.logger.error "Octopus.logger.error transaction: #{e.message}"
+          select_connection.verify!
+          retry if (retries += 1) < 3
+        else
+          raise e.message
+        end
       end
     end
 
@@ -160,13 +204,6 @@ module Octopus
 
     def clear_all_connections!
       with_each_healthy_shard(&:disconnect!)
-
-      if Octopus.atleast_rails52?
-        # On Rails 5.2 it is no longer safe to re-use connection pools after they have been discarded
-        # This happens on webservers with forking, for example Phusion Passenger.
-        # Therefor after we clear all connections we reinitialize the shards to get fresh and not discarded ConnectionPool objects
-        proxy_config.reinitialize_shards
-      end
     end
 
     def connected?
@@ -192,43 +229,46 @@ module Octopus
     def current_model_replicated?
       replicated && (current_model.try(:replicated) || fully_replicated?)
     end
-    
-    def initialize_schema_migrations_table
-      if Octopus.atleast_rails52?
-        select_connection.transaction { ActiveRecord::SchemaMigration.create_table }
-      else 
-        select_connection.initialize_schema_migrations_table
-      end
-    end
-    
-    def initialize_metadata_table
-      select_connection.transaction { ActiveRecord::InternalMetadata.create_table }
-    end
 
     protected
+
+    def connection_bad(error)
+      error.include? "PG::ConnectionBad"
+    end
 
     # @thiagopradi - This legacy method missing logic will be keep for a while for compatibility
     # and will be removed when Octopus 1.0 will be released.
     # We are planning to migrate to a much stable logic for the Proxy that doesn't require method missing.
     def legacy_method_missing_logic(method, *args, &block)
-      if should_clean_connection_proxy?(method)
-        conn = select_connection
-        clean_connection_proxy
-        conn.send(method, *args, &block)
-      elsif should_send_queries_to_shard_slave_group?(method)
-        send_queries_to_shard_slave_group(method, *args, &block)
-      elsif should_send_queries_to_slave_group?(method)
-        send_queries_to_slave_group(method, *args, &block)
-      elsif should_send_queries_to_replicated_databases?(method)
-        send_queries_to_selected_slave(method, *args, &block)
-      else
-        val = select_connection.send(method, *args, &block)
+      begin
+        retries ||= 0
+        if should_clean_connection_proxy?(method)
+          conn = select_connection
+          clean_connection_proxy
+          conn.send(method, *args, &block)
+        elsif should_send_queries_to_shard_slave_group?(method)
+          send_queries_to_shard_slave_group(method, *args, &block)
+        elsif should_send_queries_to_slave_group?(method)
+          send_queries_to_slave_group(method, *args, &block)
+        elsif should_send_queries_to_replicated_databases?(method)
+          send_queries_to_selected_slave(method, *args, &block)
+        else
+          val = select_connection.send(method, *args, &block)
 
-        if val.instance_of? ActiveRecord::Result
-          val.current_shard = shard_name
+          if val.instance_of? ActiveRecord::Result
+            val.current_shard = shard_name
+          end
+
+          val
         end
-
-        val
+      rescue ActiveRecord::StatementInvalid => e
+        if connection_bad(e.message)
+          Octopus.logger.error "Octopus.logger.error legacy_method_missing_logic: #{e.message}"
+          select_connection.verify!
+          retry if (retries += 1) < 3
+        else
+          raise e.message
+        end
       end
     end
 
